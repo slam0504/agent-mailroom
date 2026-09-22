@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agent-mailroom": {
+      "type": "stdio",
+      "command": "/absolute/path/to/agent-mailroom/.venv/bin/agent-mailroom",
+      "args": [
+        "mcp",
+        "--url",
+        "http://127.0.0.1:8765"
+      ]
+    }
+  }
+}

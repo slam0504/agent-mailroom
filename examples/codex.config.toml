@@ -1,0 +1,10 @@
+# Merge this section into the Codex config used by your host; replace the absolute path.
+# Each agent registers its own session through the tools. This config can be shared.
+[mcp_servers.agent-mailroom]
+command = "/absolute/path/to/agent-mailroom/.venv/bin/agent-mailroom"
+args = [
+  "mcp",
+  "--url",
+  "http://127.0.0.1:8765",
+]
+tool_timeout_sec = 45

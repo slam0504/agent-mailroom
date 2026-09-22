@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-mailroom"
+version = "0.7.0"
+description = "Local mailboxes for communication between coding agents"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "anyio>=4,<5",
+  "fastapi>=0.115,<1",
+  "filelock>=3.18,<4",
+  "httpx>=0.28,<1",
+  "mcp>=2,<3",
+  "pydantic>=2.11,<3",
+  "starlette>=0.40,<2",
+  "uvicorn>=0.34,<1",
+]
+
+[project.scripts]
+agent-mailroom = "agent_mailroom.cli:main"
+
+[project.optional-dependencies]
+bat = ["websockets>=17,<18"]
+
+[dependency-groups]
+dev = ["cryptography>=46,<51", "pytest>=8,<10", "ruff>=0.12,<1", "websockets>=17,<18"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
