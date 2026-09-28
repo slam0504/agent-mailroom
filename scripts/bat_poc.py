@@ -1,4 +1,4 @@
-"""Manual Claude transport probe for BAT v3.2.10; not a mailroom wake worker."""
+"""Manual Claude transport probe for BAT >= 3.2.10; not a mailroom wake worker."""
 
 import argparse
 import getpass

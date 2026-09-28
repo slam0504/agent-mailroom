@@ -128,11 +128,67 @@ def test_fingerprint_mismatch_never_sends_token(client):
     assert peer.sent == []
 
 
-@pytest.mark.parametrize("version", ["3.2.9", "3.2.11-pre.2"])
+@pytest.mark.parametrize(
+    "version",
+    ["3.2.10", "3.2.10+build.01", "3.2.11-pre.2", "3.2.11", "3.2.12", "3.2.100", "3.3.0", "4.0.0"],
+)
+def test_supported_version_reports_actual_server_version(client, version):
+    peer, probe, observations = client
+    peer.version = version
+    probe.authenticate("secret", hashlib.sha256(b"test-certificate").hexdigest())
+    assert observations == [("connected", {"serverVersion": version, "protocol": poc.PROTOCOL})]
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "3.2.9",
+        "3.1.999",
+        "2.99.999",
+        "3.2.10-rc.1",
+        "3.2.10-rc.1+build",
+        None,
+        3212,
+        True,
+        [],
+        "",
+        "3.2",
+        "v3.2.12",
+        "3.02.12",
+        "3.2.12.1",
+        "3.2.12-01",
+        "3.2.12-",
+        "3.2.12+",
+        "3.2.12\n",
+    ],
+)
 def test_version_skew_stops_before_profile_or_send(client, version):
     peer, probe, _ = client
     peer.version = version
-    with pytest.raises(poc.ProbeError, match="requires BAT 3.2.10"):
+    with pytest.raises(poc.ProbeError, match="requires BAT >= 3.2.10"):
+        probe.authenticate("secret", hashlib.sha256(b"test-certificate").hexdigest())
+    assert [f["type"] for f in peer.sent] == ["auth"]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"result": False},
+        {"protocol": "bat-remote/v3"},
+        {"compression": "gzip"},
+        {"capabilities": {"profileContext": 2}},
+    ],
+)
+def test_newer_version_does_not_bypass_other_auth_checks(client, monkeypatch, invalid):
+    peer, probe, _ = client
+    peer.version = "4.0.0"
+    receive = probe.receive
+
+    def invalid_auth(timeout):
+        return {**receive(timeout), **invalid}
+
+    monkeypatch.setattr(probe, "receive", invalid_auth)
+    with pytest.raises(poc.ProbeError, match="requires BAT >= 3.2.10"):
         probe.authenticate("secret", hashlib.sha256(b"test-certificate").hexdigest())
     assert [f["type"] for f in peer.sent] == ["auth"]
 
@@ -264,8 +320,8 @@ def test_events_are_filtered_by_context_and_target_even_before_rpc_reply(client)
     assert observations[-1][1]["completion"] == "not_automatically_verified"
 
 
-@pytest.fixture
-def tls_bat_peer(tmp_path):
+@pytest.fixture(params=["3.2.10", "3.2.12", "3.3.0", "4.0.0"])
+def tls_bat_peer(tmp_path, request):
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     cert = (
@@ -294,6 +350,7 @@ def tls_bat_peer(tmp_path):
     # BAT's TLS server and certificate pinning aren't changed by this test setting.
     tls.num_tickets = 0
     peer = Peer()
+    peer.version = request.param
     frame_lock = threading.Lock()
 
     def handler(ws):

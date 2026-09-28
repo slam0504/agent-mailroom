@@ -2,7 +2,7 @@
 
 server 啟動時只設定 BAT 連線與 token。之後每個 agent 在 `create_room`／`join_room` 時提供自己的 BAT terminal ID，server 就會建立通知綁定。另一組協作可以隨時另開房間，不需更新啟動設定或重啟 server。
 
-本次協作依使用者指定的「完成工作後才通知對方下一個動作」流程執行，不另外加入忙碌等待機制。支援 BAT **3.2.10** 的一般 Claude Agent、Claude Agent Worktree 與一般 Codex Agent。Channel、CLI、remote profile alias 不在支援範圍內。
+本次協作依使用者指定的「完成工作後才通知對方下一個動作」流程執行，不另外加入忙碌等待機制。版本僅限制最低 **BAT 3.2.10**，以 SemVer 比較，不設最高版本或逐版白名單；`3.2.10-rc.1` 低於門檻，`3.2.11-pre.2` 高於門檻，build metadata 不影響比較。版本缺失或格式不合法時拒絕連線。驗證成功、protocol v2、compression none、profileContext 1，以及 profile／runtime／terminal／cwd 檢查仍須全部通過。適用一般 Claude Agent、Claude Agent Worktree 與一般 Codex Agent；Channel、CLI、remote profile alias 不在支援範圍內。版本符合門檻不等於新版實機通知已驗證。
 
 ## 1. 啟動一次 server
 

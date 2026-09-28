@@ -1,4 +1,4 @@
-"""BAT v3.2.10 transport shared by the manual PoC and optional notification worker."""
+"""BAT transport shared by the manual PoC and optional notification worker."""
 
 import hashlib
 import hmac
@@ -11,8 +11,32 @@ from urllib.parse import urlsplit
 from websockets.exceptions import WebSocketException
 
 PROTOCOL = "bat-remote/v2"
-BAT_VERSION = "3.2.10"
+MIN_BAT_VERSION = (3, 2, 10)
 CLAUDE_PRESETS = {"claude-code", "claude-code-worktree"}
+
+
+def supported_bat_version(value):
+    """Compare a valid SemVer against the minimum stable release."""
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        value,
+    )
+    if not match:
+        return False
+    prerelease = match[4]
+    if prerelease and any(
+        part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")
+    ):
+        return False
+    try:
+        version = tuple(int(match[i]) for i in (1, 2, 3))
+    except ValueError:
+        return False
+    return version > MIN_BAT_VERSION or (version == MIN_BAT_VERSION and prerelease is None)
 
 
 class ProbeError(Exception):
@@ -126,11 +150,14 @@ class BatProbe:
             result.get("result") is not True
             or result.get("protocol") != PROTOCOL
             or result.get("compression") != "none"
-            or result.get("serverVersion") != BAT_VERSION
+            or not supported_bat_version(result.get("serverVersion"))
             or result.get("capabilities", {}).get("profileContext") != 1
         ):
-            raise ProbeError("This probe requires BAT 3.2.10, protocol v2 and profileContext 1.")
-        self.output("connected", serverVersion=BAT_VERSION, protocol=PROTOCOL)
+            raise ProbeError(
+                "This probe requires BAT >= 3.2.10, successful authentication, "
+                "protocol v2, compression none and profileContext 1."
+            )
+        self.output("connected", serverVersion=result["serverVersion"], protocol=PROTOCOL)
 
     def invoke(self, channel, params=None, scoped=True, submit=None):
         frame = {"type": "invoke", "channel": channel, "params": params or {}}
