@@ -1,5 +1,7 @@
 """MCP tools forward authenticated requests to the shared HTTP service."""
 
+import sqlite3
+import sys
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -8,7 +10,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
-from .identity import IdentityStore
+from .identity import IdentityStore, KeyIndex
 from .models import (
     BatRegistration,
     CollaborationState,
@@ -42,12 +44,28 @@ It requires no credential file or code-mode memory. Read only the notified messa
 acknowledged, stop. Finish work, reply to the original sender only if needed, then ack. Use
 request_id=notice-reply-<message_id> for that single reply. Never share notification_key.
 A bridge/connection may serve several agents: there is no implicit current agent or current room.
-Use resume_session with your own key after reconnecting. Names are case-sensitive.
+Names are case-sensitive.
 For retries of create_room/join_room, reuse the returned session_key and identical metadata.
-If a BAT session reset also loses session_key, use reconnect_member with the same room_id and
-member_name plus the NEW BAT terminal. The server accepts takeover only after BAT no longer lists
-the previous terminal, and only within the same profile, runtime and workspace. The old identity
-and old notification credentials are revoked; unfinished mail is notified to the new terminal.
+After restart or context compaction, follow this recovery order:
+1. If you hold your own session_key, call resume_session first. Do not claim it is lost without
+this call. Do not scan the mailroom sessions directory: it holds other agents' keys.
+2. If you do NOT hold your own session_key, call recover_session with your own current BAT
+terminal ID (never a peer's) to look it up.
+3. If a key is held or was just recovered but your BAT terminal ID changed, call join_room with
+that same key, identical member metadata (including the optional session_id label), and the new
+bat target to rebind.
+4. Only if recover_session finds nothing, or resume_session returns "Unknown session_key", use
+reconnect_member with the same room_id and member_name plus the NEW BAT terminal. An unknown key
+means the current bridge state directory cannot resolve it; check that --state-dir is correct.
+Connection errors/timeouts do not mean a lost key: restore service access and retry resume_session.
+Other errors need diagnosis, not an automatic takeover.
+The server accepts takeover only after BAT no longer lists the previous terminal, and only within
+the same profile, runtime and workspace. The old key for this room and old notification credentials
+are revoked; unfinished mail is notified to the new terminal.
+Before compaction or handoff, record room_id, member_name, BAT terminal ID, member metadata and
+this recovery order, not "the key may be lost".
+Use your own session_key for new topics or further mail; unrelated topics belong in a new message,
+not in the single notification-key reply.
 Calling create_room without a session_key intentionally starts a new collaboration room.
 Use list_members to find registered recipients; registration does not prove they are online.
 send_message stores a message; successful storage does not prove notification or processing.
@@ -95,12 +113,22 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
     url = validate_url(url)
     mcp = MCPServer("agent-mailroom", instructions=INSTRUCTIONS)
     legacy_key: str | None = None
+    key_index = KeyIndex(identities.directory)
+
+    def log_index_error(exc: Exception) -> None:
+        # Index problems are best-effort side effects; never let them break a real call.
+        print(f"agent-mailroom: session key index error: {exc}", file=sys.stderr)
 
     def credentials(session_key: str | None, *, allocate=False) -> tuple[str, str]:
         nonlocal legacy_key
         try:
             if session_key is not None:
-                return session_key, identities.token(session_key)
+                token = identities.token(session_key)
+                try:
+                    key_index.touch(session_key)
+                except (OSError, sqlite3.Error) as exc:
+                    log_index_error(exc)
+                return session_key, token
             if legacy_token is not None:
                 if legacy_key is None:
                     legacy_key, _ = identities.create(legacy_token)
@@ -120,7 +148,22 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             return notification_key
         return credentials(session_key)[1]
 
-    async def request(method: str, path: str, token: str, **kwargs):
+    def record_binding(result: Membership, key: str) -> None:
+        if result.bat_binding is None:
+            return
+        try:
+            key_index.record(
+                room_id=result.room.room_id,
+                member_name=result.member.member_name,
+                runtime=result.bat_binding.runtime,
+                profile_id=result.bat_binding.profile_id,
+                terminal_id=result.bat_binding.session_id,
+                session_key=key,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            log_index_error(exc)
+
+    async def raw_request(method: str, path: str, token: str, **kwargs) -> httpx.Response:
         # A call owns its client so cancellation also closes any long-poll connection.
         async with httpx.AsyncClient(
             base_url=url,
@@ -130,12 +173,15 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             follow_redirects=False,
         ) as client:
             try:
-                response = await client.request(method, path, **kwargs)
+                return await client.request(method, path, **kwargs)
             except httpx.RequestError as exc:
                 raise ToolError(
                     "Mailroom unavailable or request timed out. Check the HTTP service. "
                     "A send may have been stored; retry with the SAME request_id and content."
                 ) from exc
+
+    async def request(method: str, path: str, token: str, **kwargs):
+        response = await raw_request(method, path, token, **kwargs)
         if response.is_error or response.is_redirect:
             try:
                 detail = response.json().get("detail", "Unexpected server response.")
@@ -170,6 +216,7 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             raise ToolError(
                 f"{exc} Retry this registration with session_key={key}; keep this key private."
             ) from exc
+        record_binding(result, key)
         return Registration(**result.model_dump(), session_key=key)
 
     @mcp.tool()
@@ -200,6 +247,7 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             raise ToolError(
                 f"{exc} Retry this registration with session_key={key}; keep this key private."
             ) from exc
+        record_binding(result, key)
         return Registration(**result.model_dump(), session_key=key)
 
     @mcp.tool()
@@ -213,8 +261,13 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
     ) -> Registration:
         """Replace a disconnected BAT session while preserving its room membership and inbox.
 
-        Use this only when the previous session_key is unavailable after a session reset. BAT must
-        no longer list the previous terminal. The replacement must be a live terminal in the same
+        If you hold your own key, call resume_session first. If you don't hold a key, try
+        recover_session before this. Use this only after "Unknown session_key" (check
+        --state-dir), recover_session finds nothing, or when you truly hold no key;
+        never for connection errors/timeouts or other errors. If resume_session succeeds but
+        your terminal changed, use join_room with that same key, identical metadata and the new bat.
+        Successful takeover revokes the old key for this room and old notification credentials.
+        BAT must no longer list the previous terminal. The replacement must be live in the same
         profile, runtime and workspace. Keep the returned new session_key private and reuse it if
         this call must be retried.
         """
@@ -239,12 +292,20 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             raise ToolError(
                 f"{exc} Retry this reconnect with session_key={key}; keep this key private."
             ) from exc
+        record_binding(result, key)
         return Registration(**result.model_dump(), session_key=key)
 
     @mcp.tool()
     async def resume_session(room_id: Name, session_key: SessionKey | None = None) -> Registration:
         """Recover your registered room/member after reconnecting, using your private session_key.
 
+        This is the first, simplest check after restart or context compaction if you hold your key.
+        If successful but your BAT terminal ID changed, call join_room with the same key,
+        identical member metadata (including the optional session_id label), and the new bat target.
+        "Unknown session_key" means the current bridge state directory cannot resolve your key;
+        if you don't hold a key at all, try recover_session before reconnect_member.
+        Connection errors/timeouts do not mean key loss: restore service access and retry this
+        call, rather than reconnect_member.
         Does not create a room or member. No name/workspace guessing is used for identity recovery.
         """
         key, token = credentials(session_key)
@@ -252,6 +313,105 @@ def create_mcp(url: str, identities: IdentityStore, legacy_token: str | None = N
             await request("GET", f"/rooms/{room_id}/membership", token)
         )
         return Registration(**result.model_dump(), session_key=key)
+
+    @mcp.tool()
+    async def recover_session(
+        bat: BatRegistration, room_id: Name | None = None
+    ) -> list[Registration]:
+        """Recover YOUR OWN session_key(s) using only your own current BAT terminal ID.
+
+        Never pass a peer's terminal ID. Looks up this bridge's local index by
+        (runtime, profile_id, bat.session_id), confirms each candidate is still live via BAT,
+        and rebinds it. An empty list means no match: if your BAT terminal ID changed, fall back
+        to reconnect_member with the room_id/member_name you already know.
+        """
+        try:
+            key_index.purge()
+        except (OSError, sqlite3.Error) as exc:
+            log_index_error(exc)
+        try:
+            rows = key_index.lookup(
+                runtime=bat.runtime,
+                profile_id=bat.profile_id,
+                terminal_id=bat.session_id,
+                room_id=room_id,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            raise ToolError(str(exc)) from exc
+
+        def http_error_detail(response: httpx.Response) -> str:
+            try:
+                detail = response.json().get("detail", "Unexpected server response.")
+            except (ValueError, AttributeError):
+                detail = "Unexpected server response."
+            return f"Mailroom HTTP {response.status_code}: {detail}"
+
+        results: list[Registration] = []
+        for row in rows:
+            try:
+                token = identities.token(row["session_key"])
+            except ValueError:
+                # The credential file itself is the source of truth here; this row just
+                # points at a session that no longer exists, so it is stale too.
+                try:
+                    key_index.delete_row(row["room_id"], row["member_name"])
+                except (OSError, sqlite3.Error) as exc:
+                    log_index_error(exc)
+                continue
+            response = await raw_request("GET", f"/rooms/{row['room_id']}/membership", token)
+            if response.status_code in (403, 404):
+                try:
+                    key_index.delete_row(row["room_id"], row["member_name"])
+                except (OSError, sqlite3.Error) as exc:
+                    log_index_error(exc)
+                continue
+            if response.is_error or response.is_redirect:
+                raise ToolError(http_error_detail(response))
+            membership = Membership.model_validate(response.json())
+            binding = membership.bat_binding
+            if binding is None or (binding.runtime, binding.profile_id, binding.session_id) != (
+                bat.runtime,
+                bat.profile_id,
+                bat.session_id,
+            ):
+                continue
+            join_body = JoinRequest(
+                member_name=membership.member.member_name,
+                session_id=membership.member.session_id,
+                workspace=membership.member.workspace,
+                bat=bat,
+            )
+            response = await raw_request(
+                "POST",
+                f"/rooms/{row['room_id']}/members",
+                token,
+                json=join_body.model_dump(),
+            )
+            if response.status_code in (403, 404):
+                try:
+                    key_index.delete_row(row["room_id"], row["member_name"])
+                except (OSError, sqlite3.Error) as exc:
+                    log_index_error(exc)
+                continue
+            if response.is_error or response.is_redirect:
+                raise ToolError(http_error_detail(response))
+            refreshed = Membership.model_validate(
+                await request("GET", f"/rooms/{row['room_id']}/membership", token)
+            )
+            if refreshed.bat_binding is not None:
+                try:
+                    key_index.record(
+                        room_id=refreshed.room.room_id,
+                        member_name=refreshed.member.member_name,
+                        runtime=refreshed.bat_binding.runtime,
+                        profile_id=refreshed.bat_binding.profile_id,
+                        terminal_id=refreshed.bat_binding.session_id,
+                        session_key=row["session_key"],
+                    )
+                except (OSError, sqlite3.Error) as exc:
+                    log_index_error(exc)
+            results.append(Registration(**refreshed.model_dump(), session_key=row["session_key"]))
+        return results
 
     @mcp.tool()
     async def list_members(room_id: Name, session_key: SessionKey | None = None) -> list[Member]:

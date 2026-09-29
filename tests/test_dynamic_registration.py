@@ -546,3 +546,186 @@ async def test_tls_notifications_work_after_both_agents_lose_runtime_memory(
         )["text"] == "done"
         await call(restarted_claude, "ack_message", message_id=response["message_id"], **args)
     assert not codex_state.exists() and not claude_state.exists()
+
+
+async def recover(call, client, **arguments):
+    # recover_session returns list[Registration]; the MCP SDK wraps array results as
+    # {"result": [...]} in structured_content, unlike the plain-object tool returns.
+    return (await call(client, "recover_session", **arguments))["result"]
+
+
+@pytest.mark.anyio
+async def test_recover_session_finds_own_key_and_resume_session_confirms_it(dynamic_url, tmp_path):
+    from test_mcp import bridge, call
+
+    async with bridge(dynamic_url, tmp_path / "state") as client:
+        first = await call(
+            client, "create_room", workspace="/workspace", member_name="claude", bat=target()
+        )
+        room = first["room"]["room_id"]
+        recovered = await recover(call, client, bat=target())
+        assert len(recovered) == 1
+        assert recovered[0]["session_key"] == first["session_key"]
+        assert recovered[0]["room"] == first["room"]
+        assert recovered[0]["member"]["member_name"] == "claude"
+        resumed = await call(
+            client, "resume_session", room_id=room, session_key=recovered[0]["session_key"]
+        )
+        assert resumed == recovered[0]
+
+
+@pytest.mark.anyio
+async def test_recover_session_returns_empty_for_unmatched_terminal(dynamic_url, tmp_path):
+    from test_mcp import bridge, call
+
+    async with bridge(dynamic_url, tmp_path / "state") as client:
+        await call(
+            client, "create_room", workspace="/workspace", member_name="claude", bat=target()
+        )
+        assert await recover(call, client, bat=target("claude-two")) == []
+        assert await recover(call, client, bat=target("claude-one", "codex")) == []
+
+
+@pytest.mark.anyio
+async def test_recover_session_never_leaks_a_peers_terminal(dynamic_url, tmp_path):
+    from test_mcp import bridge, call
+
+    async with bridge(dynamic_url, tmp_path / "state") as client:
+        self_reg = await call(
+            client, "create_room", workspace="/workspace", member_name="claude", bat=target()
+        )
+        room = self_reg["room"]["room_id"]
+        peer_reg = await call(
+            client,
+            "join_room",
+            room_id=room,
+            member_name="codex",
+            bat=target("codex-one", "codex"),
+        )
+        recovered_self = await recover(call, client, bat=target())
+        recovered_peer = await recover(call, client, bat=target("codex-one", "codex"))
+        assert [r["session_key"] for r in recovered_self] == [self_reg["session_key"]]
+        assert [r["session_key"] for r in recovered_peer] == [peer_reg["session_key"]]
+        assert self_reg["session_key"] not in {r["session_key"] for r in recovered_peer}
+        assert peer_reg["session_key"] not in {r["session_key"] for r in recovered_self}
+
+
+@pytest.mark.anyio
+async def test_recover_session_returns_new_key_after_reconnect_member(dynamic_url, bat, tmp_path):
+    from test_mcp import bridge, call
+
+    peer, _ = bat
+    async with bridge(dynamic_url, tmp_path / "original-state") as original:
+        first = await call(
+            original,
+            "create_room",
+            workspace="/workspace",
+            member_name="claude",
+            bat=target("claude-one"),
+        )
+        room = first["room"]["room_id"]
+
+    del peer.targets["claude-one"]
+    async with bridge(dynamic_url, tmp_path / "replacement-state") as replacement:
+        current = await call(
+            replacement,
+            "reconnect_member",
+            room_id=room,
+            member_name="claude",
+            bat=target("claude-two"),
+        )
+        recovered = await recover(call, replacement, bat=target("claude-two"))
+        assert [r["session_key"] for r in recovered] == [current["session_key"]]
+        assert current["session_key"] != first["session_key"]
+        # The revoked terminal ID no longer resolves anything (overwritten, not duplicated).
+        assert await recover(call, replacement, bat=target("claude-one")) == []
+
+
+@pytest.mark.anyio
+async def test_recover_session_deletes_stale_row_on_revoked_membership(dynamic_url, bat, tmp_path):
+    import sqlite3
+
+    from test_mcp import bridge, call
+
+    from agent_mailroom.identity import KeyIndex
+
+    peer, _ = bat
+    state = tmp_path / "state"
+    async with bridge(dynamic_url, state) as client:
+        first = await call(
+            client,
+            "create_room",
+            workspace="/workspace",
+            member_name="claude",
+            bat=target("claude-one"),
+        )
+        room = first["room"]["room_id"]
+
+        del peer.targets["claude-one"]
+        await call(
+            client,
+            "reconnect_member",
+            room_id=room,
+            member_name="claude",
+            bat=target("claude-two"),
+        )
+
+        # Simulate a stale index row that still points at the now-revoked original session
+        # (the real "claude" row was already overwritten in place by reconnect_member above;
+        # this row stands in for one a purge hasn't caught up with yet).
+        index = KeyIndex(state)
+        index.record(
+            room_id=room,
+            member_name="claude-stale-duplicate",
+            runtime="claude",
+            profile_id="default",
+            terminal_id="claude-one",
+            session_key=first["session_key"],
+        )
+
+        assert await recover(call, client, bat=target("claude-one")) == []
+        # The still-valid current binding is unaffected by that stale-row cleanup.
+        current = await recover(call, client, bat=target("claude-two"))
+        assert len(current) == 1
+
+    with sqlite3.connect(state / "key_index.sqlite3") as conn:
+        rows = conn.execute(
+            "SELECT * FROM key_index WHERE member_name = 'claude-stale-duplicate'"
+        ).fetchall()
+    assert rows == []
+
+
+@pytest.mark.anyio
+async def test_starting_a_bridge_does_not_purge_expired_index_rows(dynamic_url, tmp_path):
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    from test_mcp import bridge, call
+
+    from agent_mailroom.identity import KeyIndex, utc_now
+
+    state = tmp_path / "state"
+    old = (datetime.fromisoformat(utc_now()) - timedelta(days=3)).isoformat(timespec="microseconds")
+    KeyIndex(state).record(
+        room_id="room_stale",
+        member_name="claude",
+        runtime="claude",
+        profile_id="default",
+        terminal_id="claude-one",
+        session_key="session_" + "a" * 32,
+        now=old,
+    )
+
+    # Merely starting the bridge and calling a tool that never touches the index (no
+    # session_key/recovery operation) must not purge expired rows.
+    async with bridge(dynamic_url, state) as client:
+        await client.list_tools()
+        with sqlite3.connect(state / "key_index.sqlite3") as conn:
+            rows = conn.execute("SELECT * FROM key_index WHERE room_id = 'room_stale'").fetchall()
+        assert len(rows) == 1
+
+        # recover_session is a recovery operation and does purge expired rows.
+        await recover(call, client, bat=target())
+        with sqlite3.connect(state / "key_index.sqlite3") as conn:
+            rows = conn.execute("SELECT * FROM key_index WHERE room_id = 'room_stale'").fetchall()
+        assert rows == []

@@ -319,6 +319,19 @@ def test_prompt_contains_no_peer_data(setup):
     assert "Ignore previous" not in notification_prompt(candidate, "notice_" + "a" * 64)
 
 
+def test_prompt_scopes_notification_access_and_routes_new_topics_to_own_identity():
+    prompt = notification_prompt({"room_id": "room_example", "message_id": 17}, "notice_example")
+    assert "notification_key is sufficient" in prompt
+    assert "do not scan" in prompt.lower() and "sessions directory" in prompt
+    assert "other agents' keys" in prompt
+    assert "recover a long-term session_key" not in prompt
+    assert "resume_session" in prompt
+    assert "one reply" in prompt and "with this notification_key" in prompt
+    new_topic_guidance = prompt[prompt.index("Put unrelated topics") : prompt.index("Reply BEFORE")]
+    assert "new message" in new_topic_guidance and "your own session_key" in new_topic_guidance
+    assert "notice-reply-17" in prompt
+
+
 @pytest.mark.parametrize(
     "runtime,result,expected",
     [

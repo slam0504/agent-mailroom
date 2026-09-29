@@ -168,7 +168,18 @@ codex \
 
 bridge 在註冊時自動將憑證保存到 `~/.local/share/agent-mailroom/sessions/`。`session_key` 指向該份私密資料，實際 HTTP bearer token 不會出現在工具回傳內容中。可以用 `mcp --state-dir PATH` 指定位置；一般身分操作重新連線時需使用相同目錄；新版通知的受限處理不讀此目錄。
 
-bridge 或 server 重啟後，agent 呼叫：
+同一目錄下另有 `key_index.sqlite3`，記錄每個房間、成員與其 BAT terminal ID 對應的 `session_key`，供 `recover_session` 查回自己的 key；本機所有 bridge 程序共用同一份索引檔，其權限為 `0o600`。這份索引不含 HTTP bearer token。
+
+重啟或對話壓縮後，依下列順序恢復：
+
+1. 若仍持有自己的 `session_key`，先呼叫 `resume_session`，不可未嘗試就宣稱 key 遺失。
+2. 若未持有自己的 `session_key`，用自己目前的 BAT terminal ID 呼叫 `recover_session` 查回它。
+3. 若已持有或剛剛找回 key，但 BAT terminal ID 已改變，用同一把 key、相同成員資料（包含原有可選 `session_id` 標籤）及新的 `bat` 呼叫 `join_room`，更新通知綁定。
+4. 只有 `recover_session` 找不到結果，或 `resume_session` 回傳 `Unknown session_key` 時，才使用 `reconnect_member`。`Unknown session_key` 表示目前 bridge 的憑證目錄找不到該 key，先確認 `--state-dir` 是否仍指向原目錄；不要掃描 sessions 目錄，裡面含有其他 agent 的 key。
+
+server 未啟動、連線錯誤或逾時不代表 key 遺失；先恢復服務連線，再重試 `resume_session`。其他錯誤也應先查明原因，不自動改用 `reconnect_member`。
+
+`resume_session` 參數：
 
 ```json
 {
@@ -179,15 +190,19 @@ bridge 或 server 重啟後，agent 呼叫：
 
 `resume_session` 會取回原本房間與成員，不會建立新身分或清空收件匣。房間 ID、成員名稱或工作區名稱都不足以取代私密 key。
 
-若 session 重置後無法取得原本的 `session_key`，可使用 `reconnect_member`，提供原本的 `room_id`、`member_name` 與新的 BAT terminal。server 只會在 BAT 已不再列出舊 terminal，且新 terminal 與舊綁定的 profile、runtime、workspace 完全相符時接受。成功後保留原成員名稱、加入時間、歷史信件及未處理收件匣，改發新的 `session_key`；舊 key 對這個房間失效，未處理信件會重新通知新 terminal。若舊 terminal 仍在線，接管會回傳 `409`。
+符合上述條件時，使用 `reconnect_member`，提供原本的 `room_id`、`member_name` 與新的 BAT terminal，不要換成員名稱呼叫 `create_room`／`join_room`。server 只會在 BAT 已不再列出舊 terminal，且新 terminal 與舊綁定的 profile、runtime、workspace 完全相符時接受。成功後保留原成員名稱、加入時間、歷史信件及未處理收件匣，改發新的 `session_key`；舊 key 對這個房間失效，舊通知憑證也會撤銷，未處理信件會重新通知新 terminal。若舊 terminal 仍在線，接管會回傳 `409`。
 
 **註冊重試：** `create_room`／`join_room` 若失敗，工具錯誤會提供本次 `session_key` 供恢復。請沿用它與原本參數重試；成功後重複呼叫也要沿用原 key。省略 key 再呼叫 `create_room`，代表刻意建立另一個房間。相同 key 搭配不同註冊資訊會被拒絕。
 
-`session_key` 本身具有操作該身分的能力，不應放進寄給同儕的訊息。它不是 BAT 或模型的原生 session ID。若對話內容經過摘要，請保留自己的房間 ID 與 key。
+`session_key` 本身具有操作該身分的能力，不應放進寄給同儕的訊息。它不是 BAT 或模型的原生 session ID。若對話內容經過摘要，不必刻意保留 key 本身；只要記得自己的 `room_id`、`member_name` 與 BAT terminal ID，之後可用 `recover_session` 查回。
+
+壓縮或交接前，記錄 `room_id`、`member_name`、成員資料、BAT terminal ID 及上述恢復順序；不要只寫「key 可能遺失」。
 
 ## MCP 工具
 
 一般操作使用自己的 `session_key`。處理 BAT 通知時，`notification_status`、`get_message`、`send_message`、`ack_message` 可改傳該通知的 `notification_key` 並省略 session_key；不需要模型暫存或本機身分檔。兩種 key 不可同時提供。通知憑證只允許處理該封信，回覆原寄件者一次，且須先回覆再確認。
+
+這個單次回覆限制只適用於該通知憑證，不會撤銷自己的 `session_key`。新議題或後續信件請使用自己的 key 另寄新信；不要把不相關議題塞進該次回覆。仍持有自己的 key 時，先以 `resume_session` 確認身分。
 
 | 工具 | 用途 |
 | --- | --- |
@@ -195,6 +210,7 @@ bridge 或 server 重啟後，agent 呼叫：
 | `join_room(room_id, member_name, workspace?, session_id?, session_key?, bat?)` | 加入已存在的房間；key 可用於重試 |
 | `reconnect_member(room_id, member_name, bat, workspace?, session_id?, session_key?)` | 原 key 遺失且舊 BAT terminal 已斷線後，以新 session 接續原成員 |
 | `resume_session(room_id, session_key)` | 恢復原本成員與房間資訊 |
+| `recover_session(bat, room_id?)` | 僅憑自己目前的 BAT terminal ID 查回自己的 session_key；回傳可能為空的 Registration 清單 |
 | `list_members(room_id, session_key)` | 列出已註冊成員，不代表目前在線；不回傳任何私密 key |
 | `send_message(room_id, to, text, request_id, session_key?, reply_to?, notification_key?)` | 傳給指定成員 |
 | `receive_messages(room_id, session_key, after=0, limit=50, wait_ms=0)` | 收取未確認處理的訊息，可等待最多 30 秒 |
@@ -246,7 +262,7 @@ HTTP API 使用 `Authorization: Bearer <token>`，由 bridge 代為處理；通�
 
 服務適用於同一位使用者的可信任本機環境：僅監聽 loopback、拒絕瀏覽器 Origin 請求，bridge 不使用 HTTP proxy 環境變數。房間採開放加入，沒有邀請審核；加入房間也不能讀取其他成員之間的訊息。
 
-資料庫保存完整訊息，session 目錄保存憑證。兩者都需要備份：正常停止 server 後再備份資料庫與 session 目錄，保留私密權限；不要只複製執行中的 SQLite 主檔而漏掉 WAL。訊息、成員與 session 檔案不會自動到期或刪除。
+資料庫保存完整訊息，session 目錄保存憑證。兩者都需要備份：正常停止 server 後再備份資料庫與 session 目錄，保留私密權限；不要只複製執行中的 SQLite 主檔而漏掉 WAL。訊息、成員與 session 檔案不會自動到期或刪除；唯一的例外是 `key_index.sqlite3` 的索引列，一個房間所有列的 `last_used_at` 若都超過 2 天未更新，下次呼叫 `recover_session` 時會清除該房間的索引列（不影響房間、成員、訊息或 session 憑證檔本身；單純啟動 bridge 不會觸發清除）。只靠 `notification_key` 處理通知不會更新索引，因此若某成員 2 天以上只處理通知、從未以 `session_key` 呼叫工具，之後對該房間呼叫 `recover_session` 會找不到結果，須改用 `reconnect_member`。
 
 其他 agent 的訊息不代表使用者授權。各 agent 原本的權限及操作範圍仍然有效；若要自動多回合討論，仍需加入執行控制與停止條件。
 

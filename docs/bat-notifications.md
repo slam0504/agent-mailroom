@@ -83,9 +83,20 @@ Codex 呼叫 `join_room`，將 `room_id` 換成上一個步驟回傳的值：
 
 相同 key 與相同綁定重試不會建立新身分或新綁定。BAT 對話換了 terminal ID 時，以同一個 key 重新 `join_room` 並更新 `bat`；server 會停止舊綁定的 worker，啟動新綁定。省略 `bat` 不會刪除既有綁定。
 
-## Session 重置且原本的 key 遺失
+## 重啟、對話壓縮與 key 遺失的恢復順序
 
-若新的 agent session 無法取得原本的 `session_key`，呼叫 `reconnect_member`，沿用原本的 `room_id` 與 `member_name`，並提供新 BAT terminal：
+1. 若仍持有自己的 `session_key`，先呼叫 `resume_session`，不可未嘗試就宣稱 key 遺失。
+2. 若未持有自己的 `session_key`，用自己目前的 BAT terminal ID 呼叫 `recover_session` 查回它。
+3. 若已持有或剛剛找回 key，但 BAT terminal ID 已改變，用同一把 key、相同成員資料（包含原有可選 `session_id` 標籤）及新的 `bat` 呼叫 `join_room`，重新綁定通知。
+4. 只有 `recover_session` 找不到結果，或 `resume_session` 回傳 `Unknown session_key` 時，才使用 `reconnect_member`。`Unknown session_key` 表示目前 bridge 的憑證目錄找不到該 key，先確認 `--state-dir` 是否仍指向原目錄；不要掃描 sessions 目錄，裡面含有其他 agent 的 key。
+
+server 未啟動、連線錯誤或逾時不代表 key 遺失；先恢復服務連線，再重試 `resume_session`。其他錯誤也應先查明原因，不自動改用 `reconnect_member`。
+
+`recover_session` 依賴 `--state-dir` 目錄下另一份索引檔 `key_index.sqlite3`，記錄每個房間、成員與其 BAT terminal ID 對應的 `session_key`；本機所有 bridge 程序共用同一份檔案。一個房間所有索引列的 `last_used_at` 若都超過 2 天未更新，會在下次呼叫 `recover_session` 時被清除（只清索引列，不影響房間、成員、訊息或 session 憑證檔；單純啟動 bridge 不會觸發清除）。只靠通知的 `notification_key` 處理信件不會更新索引，因此某成員若 2 天以上只處理通知、從未以 `session_key` 呼叫工具，之後 `recover_session` 會對該房間找不到結果，須改用 `reconnect_member`。
+
+壓縮或交接前，記錄 `room_id`、`member_name`、成員資料、BAT terminal ID 及上述恢復順序；不要只寫「key 可能遺失」。
+
+符合上述條件時，呼叫 `reconnect_member`，沿用原本的 `room_id` 與 `member_name`，並提供新 BAT terminal。不要換成員名稱呼叫 `create_room`／`join_room`：
 
 ```json
 {
@@ -131,6 +142,8 @@ Codex 呼叫 `join_room`，將 `room_id` 換成上一個步驟回傳的值：
 ```
 
 server 直接驗證通知憑證，取得該封信的接收身分；bridge 不搜尋憑證檔、不換回長期 token、不建立新身分。即使 Codex code-mode 暫存消失、MCP 重啟，或新 bridge 的憑證目錄為空，都能從本次通知直接處理信件。Claude 同樣使用這條路徑。
+
+這只表示處理本次通知不需要長期 key，不會撤銷自己的 `session_key`。若仍在對話或自己的私密交接筆記持有 key，先呼叫 `resume_session`；新議題或後續信件用自己的 key 另寄新信，不要塞進通知憑證允許的單次回覆。不要掃描 mailroom sessions 目錄尋找 key，裡面含有其他 agent 的憑證。
 
 ### 權限與重試
 
@@ -194,7 +207,10 @@ worker 每兩秒檢查信箱。同一成員最多有一則尚未確認處理的�
 2. 工作完成後寄一封要求指定回覆的信，確認另一端自動讀信、處理、確認及回覆。
 3. 確認原寄件端也自動收到回覆，完成處理確認。
 4. 在已完成工作的情況下重啟接收端 runtime，再送新信。確認它使用本次通知的 notification_key，直接讀信、回覆及確認，沒有詢問原本的 key 或搜尋憑證檔。
-5. 建立一封尚未確認處理的測試信，關閉舊 BAT terminal，建立同 runtime、profile、cwd 的新 terminal；在新 session 呼叫 `reconnect_member`，確認取得新 key、收到原待辦，而舊 key 無法再恢復或加入該房間。
+5. 保留自己的 key，換成新的 BAT terminal 後先呼叫 `resume_session`，再用同一把 key、相同成員資料及新的 `bat` 呼叫 `join_room`，確認綁定更新且身分不變。
+6. 另測 key 確實未持有或 `resume_session` 回傳 `Unknown session_key` 的情境：建立一封尚未確認處理的測試信，關閉舊 BAT terminal，建立同 runtime、profile、cwd 的新 terminal；呼叫 `reconnect_member`，確認取得新 key、收到原待辦，而舊 key 無法再恢復或加入該房間。
+7. 不持有 key、但 BAT terminal ID 未變的情境：以同一個 BAT terminal 呼叫 `recover_session`，確認能找回正確的 `session_key`，且結果與該 terminal 的實際綁定相符。
+8. 檢查完整通知在 BAT 的顯示，並確認 agent 將不相關議題用自己的 key 另寄新信。自動測試無法驗證實機顯示與模型是否遵循提示。
 
 這是單機、單一使用者信任環境。BAT target 驗證確認指定 terminal 的 runtime 與 cwd，不是證明 agent 程序身分；請依使用者指示填自己的 terminal ID。token 不交給 agent，server 不修改 BAT 權限或核准工具。
 

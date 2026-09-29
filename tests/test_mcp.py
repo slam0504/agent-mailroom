@@ -7,7 +7,8 @@ import httpx
 import pytest
 from mcp import Client, StdioServerParameters
 
-from agent_mailroom.identity import open_identity
+from agent_mailroom.bridge import INSTRUCTIONS, create_mcp
+from agent_mailroom.identity import IdentityStore, open_identity
 
 
 def bridge(url, state_dir, identity_file=None):
@@ -23,6 +24,38 @@ async def call(client, name, **arguments):
     return result.structured_content
 
 
+def test_instructions_check_held_key_before_rebinding_or_takeover():
+    recovery = INSTRUCTIONS.split("follow this recovery order:", 1)[1]
+    assert recovery.index("resume_session") < recovery.index("recover_session")
+    assert recovery.index("recover_session") < recovery.index("join_room")
+    assert recovery.index("join_room") < recovery.index("reconnect_member")
+    assert "Unknown session_key" in recovery
+    assert "Connection errors/timeouts do not mean a lost key" in recovery
+    assert "identical" in recovery and "member metadata" in recovery
+    assert "old notification credentials" in recovery and "are revoked" in recovery
+    handoff = recovery[recovery.index("Before compaction or handoff") :]
+    assert "room_id" in handoff and "member_name" in handoff and "BAT terminal ID" in handoff
+
+
+@pytest.mark.anyio
+async def test_tool_descriptions_explain_recovery_preconditions_and_cost(tmp_path):
+    server = create_mcp("http://127.0.0.1:8765", IdentityStore(tmp_path / "sessions"))
+    async with Client(server) as client:
+        descriptions = {tool.name: tool.description for tool in (await client.list_tools()).tools}
+    reconnect = descriptions["reconnect_member"]
+    assert "resume_session first" in reconnect
+    assert "recover_session before this" in reconnect
+    assert "Unknown" in reconnect and "truly hold no key" in reconnect
+    assert "never for connection" in reconnect
+    assert "revokes the old key for this room" in reconnect
+    assert "old notification credentials" in reconnect
+    resume = descriptions["resume_session"]
+    assert "first" in resume and "restart" in resume
+    assert "join_room with the same key" in resume and "new bat target" in resume
+    assert "recover_session before reconnect_member" in resume
+    assert "Connection errors/timeouts do not mean key loss" in resume
+
+
 @pytest.mark.anyio
 async def test_two_stdio_bridges_exchange_mail_and_resume(live_url, tmp_path):
     state = tmp_path / "sessions"
@@ -33,6 +66,7 @@ async def test_two_stdio_bridges_exchange_mail_and_resume(live_url, tmp_path):
             "join_room",
             "reconnect_member",
             "resume_session",
+            "recover_session",
             "list_members",
             "send_message",
             "receive_messages",
