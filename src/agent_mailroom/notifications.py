@@ -294,8 +294,14 @@ class NotificationWorker:
         terminal, state = probe.target(candidate["session_id"], runtime=candidate["runtime"])
         if terminal["cwd"] != candidate["workspace"]:
             raise ProbeError("Target workspace changed; notification was not sent.")
-        if state["isResting"] or state.get("pendingAskUser") or state.get("pendingPermission"):
-            self.store.binding_error(candidate["binding_id"], "waiting_for_BAT_user_or_resting")
+        if state["isResting"]:
+            self.store.binding_error(candidate["binding_id"], "resting")
+            return
+        # Claude queues the notice behind a turn blocked on the user; Codex would replace it.
+        if candidate["runtime"] == "codex" and (
+            state.get("pendingAskUser") or state.get("pendingPermission")
+        ):
+            self.store.binding_error(candidate["binding_id"], "waiting_for_BAT_user")
             return
         self.store.binding_error(candidate["binding_id"], None)
         client_id = "mailroom-notify-" + uuid4().hex

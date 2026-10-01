@@ -183,9 +183,11 @@ v0.5 以前的通知沒有 notification_key。升級不會自動重送 accepted�
 
 worker 每兩秒檢查信箱。同一成員最多有一則尚未確認處理的通知；後面的信等待最舊信件被確認。
 
+對話處於 resting 時不送出，`last_error` 為 `resting`；使用者喚醒後才送。Claude 等待使用者回答或權限確認時照常送出，由 BAT 排在該回合之後。Codex 在回合進行中收到訊息會取代該回合，因此等待使用者時不送出，`last_error` 為 `waiting_for_BAT_user`。
+
 | 通知狀態 | 意義 |
 | --- | --- |
-| 尚無紀錄 | 未嘗試送出；可能尚無新信、暫停、BAT 不可用、resting、等待使用者或目標不符 |
+| 尚無紀錄 | 未嘗試送出；可能尚無新信、暫停、BAT 不可用、resting、Codex 等待使用者或目標不符 |
 | submitting | 已保存送出意圖，正在送出或等待 BAT 回應 |
 | accepted | Claude 回傳 `ok: true, accepted: true`，或 Codex 回傳 `ok: true`；仍需處理並確認信件 |
 | unknown | 送出逾時、不明回應或 submitting 時重啟；不自動重送 |

@@ -237,9 +237,20 @@ def test_leave_unbinds_and_rejects_new_mail_but_preserves_history(setup):
     assert store.next_notification(worker.binding["binding_id"]) is None
 
 
-@pytest.mark.parametrize("condition", ["resting", "permission", "question", "cwd"])
-def test_preflight_defers_without_creating_attempt(setup, condition):
-    store, room, worker = setup
+@pytest.mark.parametrize(
+    "runtime,condition",
+    [
+        ("claude", "resting"),
+        ("claude", "cwd"),
+        ("codex", "resting"),
+        ("codex", "permission"),
+        ("codex", "question"),
+        ("codex", "cwd"),
+    ],
+)
+def test_preflight_defers_without_creating_attempt(setup, runtime, condition):
+    store, room, previous = setup
+    worker = NotificationWorker(store, replace(previous.settings, runtime=runtime))
     send(store, room)
     probe = Probe()
     if condition == "cwd":
@@ -257,6 +268,19 @@ def test_preflight_defers_without_creating_attempt(setup, condition):
     assert probe.frames == []
     assert store.notification_status(room, "b")["pending_notification"] is None
     assert store.next_notification(worker.binding["binding_id"]) is not None
+
+
+@pytest.mark.parametrize("key", ["pendingPermission", "pendingAskUser"])
+def test_claude_waiting_for_user_still_receives_queued_notice(setup, key):
+    store, room, worker = setup
+    send(store, room)
+    probe = Probe()
+    probe.state[key] = True  # BAT may also report a stale prompt the user can no longer answer.
+    deliver(store, worker, probe)
+    assert len(probe.frames) == 1
+    status = store.notification_status(room, "b")
+    assert status["pending_notification"]["state"] == "accepted"
+    assert status["binding"]["last_error"] is None
 
 
 def test_operator_binding_requires_exact_member_workspace_and_local_host(setup):
