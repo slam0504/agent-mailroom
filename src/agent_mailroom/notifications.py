@@ -15,6 +15,9 @@ from .bat import BatProbe, ProbeError, fingerprint, open_connection, validate_ur
 from .models import MailroomError, Name, SessionId, Workspace
 from .store import Store
 
+POLL_DELAY = 2
+MAX_RETRY_DELAY = 30  # Deferred targets back off 2, 4, 8, 16, 30 seconds.
+
 
 @dataclass(frozen=True)
 class BatConnectionSettings:
@@ -253,21 +256,28 @@ class NotificationWorker:
             raise RuntimeError("BAT notification worker did not stop within 15 seconds.")
 
     def run(self):
+        delay = POLL_DELAY
         try:
             while not self.stopping.is_set():
+                deferred = False
                 try:
-                    self.dispatch_once()
+                    deferred = self.dispatch_once()
                 except Exception as exc:
                     # Report failure in the member's status without dumping tokens/frames.
                     self.store.binding_error(
                         self.binding["binding_id"], f"worker_error:{type(exc).__name__}"
                     )
-                self.stopping.wait(2)
+                if not deferred:
+                    delay = POLL_DELAY
+                self.stopping.wait(delay)
+                if deferred:
+                    delay = min(delay * 2, MAX_RETRY_DELAY)
         finally:
             with self.store.delivery_lock:
                 self.store.dispatch_binding_ids.discard(self.binding["binding_id"])
 
     def dispatch_once(self):
+        """Return True when a pending notice was deferred and the next check should back off."""
         candidate = self.store.next_notification(self.binding["binding_id"])
         if candidate is None or self.stopping.is_set():
             return
@@ -281,10 +291,11 @@ class NotificationWorker:
                 probe = BatProbe(ws, output=lambda *args, **kwargs: None)
                 probe.authenticate(settings.token, settings.fingerprint)
                 probe.open_profile(settings.profile_id)
-                self.deliver(probe, candidate)
+                return self.deliver(probe, candidate)
         except (ProbeError, OSError, ValueError, WebSocketException) as exc:
             detail = str(exc) if isinstance(exc, ProbeError) else type(exc).__name__
             self.store.binding_error(candidate["binding_id"], f"preflight_failed:{detail}")
+            return True
         finally:
             with self.socket_lock:
                 self.ws = None
@@ -295,13 +306,13 @@ class NotificationWorker:
             raise ProbeError("Target workspace changed; notification was not sent.")
         if state["isResting"]:
             self.store.binding_error(candidate["binding_id"], "resting")
-            return
+            return True
         # Claude queues the notice behind a turn blocked on the user; Codex would replace it.
         if candidate["runtime"] == "codex" and (
             state.get("pendingAskUser") or state.get("pendingPermission")
         ):
             self.store.binding_error(candidate["binding_id"], "waiting_for_BAT_user")
-            return
+            return True
         self.store.binding_error(candidate["binding_id"], None)
         client_id = "mailroom-notify-" + uuid4().hex
         notification_key = "notice_" + secrets.token_hex(32)

@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from filelock import Timeout
 
+from agent_mailroom import notifications
 from agent_mailroom.api import create_app
 from agent_mailroom.bat import ProbeError
 from agent_mailroom.models import CreateRoomRequest, JoinRequest, MailroomError, SendRequest
@@ -264,10 +265,59 @@ def test_preflight_defers_without_creating_attempt(setup, runtime, condition):
             "question": "pendingAskUser",
         }[condition]
         probe.state[key] = True
-        deliver(store, worker, probe)
+        candidate = store.next_notification(worker.binding["binding_id"])
+        assert worker.deliver(probe, candidate) is True  # Deferred: the worker backs off.
     assert probe.frames == []
     assert store.notification_status(room, "b")["pending_notification"] is None
     assert store.next_notification(worker.binding["binding_id"]) is not None
+
+
+def test_unreachable_bat_is_a_deferred_preflight_failure(setup, monkeypatch):
+    store, room, worker = setup
+    send(store, room)
+
+    def refuse(settings):
+        raise ConnectionRefusedError
+
+    monkeypatch.setattr(notifications, "bat_connection", refuse)
+    assert worker.dispatch_once() is True
+    status = store.notification_status(room, "b")
+    assert status["binding"]["last_error"] == "preflight_failed:ConnectionRefusedError"
+    assert status["pending_notification"] is None
+
+
+class ScriptedStop:
+    """Stands in for worker.stopping: records each wait and stops after the script ends."""
+
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.waits = []
+
+    def is_set(self):
+        return len(self.waits) >= self.rounds
+
+    def wait(self, delay):
+        self.waits.append(delay)
+
+
+def test_deferred_checks_back_off_and_reset_after_progress(setup):
+    store, room, worker = setup
+    outcomes = iter([True] * 6 + [None, True, True, False])
+
+    def dispatch_once():
+        outcome = next(outcomes)
+        if outcome is False:
+            raise RuntimeError("unexpected")
+        return outcome
+
+    worker.dispatch_once = dispatch_once
+    worker.stopping = ScriptedStop(10)
+    worker.run()
+    # Resting/waiting/preflight back off to 30s; delivery, no mail or other errors poll at 2s.
+    assert worker.stopping.waits == [2, 4, 8, 16, 30, 30, 2, 2, 4, 2]
+    assert store.notification_status(room, "b")["binding"]["last_error"] == (
+        "worker_error:RuntimeError"
+    )
 
 
 @pytest.mark.parametrize("key", ["pendingPermission", "pendingAskUser"])
