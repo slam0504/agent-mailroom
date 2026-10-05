@@ -14,7 +14,7 @@ v0.3 的背景通知改由 [BAT Claude 自動通知](bat-notifications.md) 提�
 - 等待使用者回答／權限確認，或被設為 resting 的對話會拒絕送入。這是 PoC 的保守選擇；請先在 BAT 處理。
 - profile、preset、state 的檢查與送出仍是分開的操作。測試時請勿關閉、替換或切換目標 runtime；本腳本沒有提供 BAT 端的原子綁定保證。
 
-來源為 BAT tag 內的 `src-tauri/src/{remote_server,remote_core,profile_context}.rs`、`src-tauri/src/commands/claude.rs`、`node-sidecar/src/handlers/claude-{session,send}.mjs` 與 `renderer/src/types/agent-presets.ts`。Python 連線介面依據 [websockets 同步 client 文件](https://websockets.readthedocs.io/en/stable/reference/sync/client.html)。
+來源為 BAT tag 內的 `src-tauri/src/{remote_server,remote_core,profile_context}.rs`、`src-tauri/src/commands/claude.rs`、`node-sidecar/src/handlers/claude-{session,send}.mjs` 與 `renderer/src/types/agent-presets.ts`。Python 連線介面依據 [websockets asyncio client 文件](https://websockets.readthedocs.io/en/stable/reference/asyncio/client.html)：對外仍是同步呼叫，實際由專用的事件迴圈執行緒代為執行，確保連線的 SSL 物件只被該執行緒存取。
 
 ## 連線與查詢
 

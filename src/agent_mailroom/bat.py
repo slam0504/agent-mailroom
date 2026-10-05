@@ -1,13 +1,16 @@
 """BAT transport shared by the manual PoC and optional notification worker."""
 
+import asyncio
 import hashlib
 import hmac
 import json
 import re
+import threading
 import time
 import uuid
 from urllib.parse import urlsplit
 
+from websockets.asyncio.client import connect as _connect
 from websockets.exceptions import WebSocketException
 
 PROTOCOL = "bat-remote/v2"
@@ -41,6 +44,68 @@ def supported_bat_version(value):
 
 class ProbeError(Exception):
     pass
+
+
+_loop_lock = threading.Lock()
+_loop = None
+
+
+def _bat_loop():
+    """Shared daemon event loop that exclusively owns every BAT SSL object; started once."""
+    global _loop
+    with _loop_lock:
+        if _loop is None:
+            _loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=_loop.run_forever, name="mailroom-bat-loop", daemon=True
+            ).start()
+    return _loop
+
+
+class BatConnection:
+    """Sync facade over websockets.asyncio.client; every call is marshalled to the loop thread."""
+
+    def __init__(self, connection, loop, peer_cert):
+        self._connection = connection
+        self._loop = loop
+        self._peer_cert = peer_cert
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def send(self, text):
+        self._run(self._connection.send(text))
+
+    def recv(self, timeout):
+        # websockets documents that canceling recv() loses no data, so a timeout is safe here.
+        return self._run(asyncio.wait_for(self._connection.recv(), timeout))
+
+    def close(self):
+        self._run(self._connection.close())
+
+    def peer_certificate(self):
+        return self._peer_cert
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+def open_connection(url, ssl_context, **connect_kwargs):
+    """Open a BAT connection on the shared loop thread; no other thread touches its SSL object."""
+    loop = _bat_loop()
+
+    async def opener():
+        connection = await _connect(url, ssl=ssl_context, **connect_kwargs)
+        # Still on the loop, right after the handshake: capture the peer certificate before
+        # any other coroutine can run.
+        ssl_object = connection.transport.get_extra_info("ssl_object")
+        peer_cert = ssl_object.getpeercert(binary_form=True) if ssl_object else None
+        return BatConnection(connection, loop, peer_cert)
+
+    return asyncio.run_coroutine_threadsafe(opener(), loop).result()
 
 
 def emit(kind, **values):
@@ -130,7 +195,7 @@ class BatProbe:
                 return reply
 
     def authenticate(self, token, expected_fingerprint):
-        cert = self.ws.socket.getpeercert(binary_form=True)
+        cert = self.ws.peer_certificate()
         if not cert or not hmac.compare_digest(
             hashlib.sha256(cert).hexdigest(), fingerprint(expected_fingerprint)
         ):

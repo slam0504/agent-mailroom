@@ -10,9 +10,8 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter
 from websockets.exceptions import WebSocketException
-from websockets.sync.client import connect
 
-from .bat import BatProbe, ProbeError, fingerprint, validate_url
+from .bat import BatProbe, ProbeError, fingerprint, open_connection, validate_url
 from .models import MailroomError, Name, SessionId, Workspace
 from .store import Store
 
@@ -59,9 +58,9 @@ def bat_connection(settings):
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls.check_hostname = False
     tls.verify_mode = ssl.CERT_NONE  # Exact fingerprint checked before sending the token.
-    return connect(
+    return open_connection(
         settings.url,
-        ssl=tls,
+        tls,
         proxy=None,
         compression=None,
         open_timeout=5,
