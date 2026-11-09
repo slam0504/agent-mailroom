@@ -1,10 +1,12 @@
 """SQLite persistence. Each operation owns its connection and transaction."""
 
 import hashlib
+import re
+import secrets
 import sqlite3
 import threading
 from contextlib import closing, contextmanager, nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +24,7 @@ from .models import (
     RoomInfo,
     SendRequest,
 )
+from .prompt import notification_prompt
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rooms (
@@ -72,6 +75,9 @@ CREATE TABLE IF NOT EXISTS bat_bindings (
     workspace TEXT NOT NULL,
     runtime TEXT NOT NULL DEFAULT 'claude' CHECK (runtime IN ('claude', 'codex')),
     last_error TEXT,
+    binding_state TEXT CHECK (binding_state IN ('pending', 'confirmed', 'rejected')),
+    binding_version INTEGER CHECK (binding_version >= 0),
+    host_id TEXT,
     UNIQUE (room_id, member_id),
     FOREIGN KEY (room_id, member_id) REFERENCES members(room_id, member_id)
 );
@@ -86,7 +92,78 @@ CREATE TABLE IF NOT EXISTS notifications (
     updated_at TEXT NOT NULL,
     notification_key_hash TEXT
 );
+CREATE TABLE IF NOT EXISTS delivery_hosts (
+    host_id TEXT PRIMARY KEY,
+    current_epoch INTEGER NOT NULL CHECK (current_epoch >= 1),
+    registered_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS binding_generations (
+    room_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    highest_version INTEGER NOT NULL CHECK (highest_version >= 0),
+    migration_baseline INTEGER CHECK (migration_baseline >= 0),
+    PRIMARY KEY (room_id, member_id)
+);
+CREATE TABLE IF NOT EXISTS delivery_claims (
+    claim_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL UNIQUE,
+    origin TEXT NOT NULL CHECK (origin IN ('normal', 'legacy')),
+    message_id INTEGER NOT NULL REFERENCES messages(message_id),
+    room_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    binding_version INTEGER NOT NULL CHECK (binding_version >= 0),
+    host_id TEXT REFERENCES delivery_hosts(host_id),
+    host_epoch INTEGER CHECK (host_epoch >= 1),
+    state TEXT NOT NULL
+        CHECK (state IN ('submitting', 'accepted', 'not_accepted', 'unknown', 'released')),
+    unknown_reason TEXT
+        CHECK (unknown_reason IN
+            ('report_timeout', 'startup_recovery', 'runtime_unknown', 'legacy')),
+    send_deadline TEXT,
+    report_deadline TEXT,
+    notification_key_hash TEXT,
+    key_revoked_at TEXT,
+    evidence TEXT,
+    outcome_reported_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (state != 'unknown' OR unknown_reason IS NOT NULL),
+    CHECK (
+        (origin = 'normal' AND host_id IS NOT NULL AND host_epoch IS NOT NULL
+            AND send_deadline IS NOT NULL AND report_deadline IS NOT NULL
+            AND notification_key_hash IS NOT NULL)
+        OR (origin = 'legacy' AND host_id IS NULL AND host_epoch IS NULL
+            AND send_deadline IS NULL AND report_deadline IS NULL
+            AND state IN ('accepted', 'not_accepted', 'unknown'))
+    )
+);
+CREATE INDEX IF NOT EXISTS delivery_claims_message ON delivery_claims(message_id, claim_seq);
+CREATE INDEX IF NOT EXISTS delivery_claims_member ON delivery_claims(room_id, member_id);
+CREATE UNIQUE INDEX IF NOT EXISTS delivery_claims_key_lookup
+    ON delivery_claims(notification_key_hash) WHERE notification_key_hash IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS delivery_claims_legacy_message
+    ON delivery_claims(message_id) WHERE origin = 'legacy';
 """
+
+SCHEMA_VERSION = 7
+BINDING_DELIVERY_COLUMNS = {
+    "binding_state": "TEXT CHECK (binding_state IN ('pending', 'confirmed', 'rejected'))",
+    "binding_version": "INTEGER CHECK (binding_version >= 0)",
+    "host_id": "TEXT",
+}
+
+
+SEND_DEADLINE = timedelta(seconds=30)
+REPORT_DEADLINE = timedelta(minutes=10)
+BLOCKING_STATES = ("submitting", "accepted", "not_accepted", "unknown")
+OUTCOME_RESULTS = ("accepted", "not_accepted", "released", "unknown")
+RELEASE_EVIDENCE = re.compile(r"busy(:[A-Za-z0-9_.-]{1,64})?|expired|not_invoked")
+
+
+def new_notification_key() -> str:
+    return "notice_" + secrets.token_hex(32)
 
 
 def now() -> str:
@@ -100,6 +177,8 @@ class Store:
         # Serialize lifecycle changes with the final outbound socket write, not BAT's reply.
         self.delivery_lock = threading.RLock()
         self.dispatch_binding_ids: set[str] = set()
+        # Delivery deadlines and timeouts read this clock so tests can move time explicitly.
+        self.clock = lambda: datetime.now(UTC)
 
     @contextmanager
     def connection(self):
@@ -118,12 +197,12 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > 6:
+            if version > SCHEMA_VERSION:
                 raise RuntimeError("Database was created by a newer Agent Mailroom version.")
             old_members = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'members'"
             ).fetchone()
-            if old_members and version < 6:
+            if old_members and version < SCHEMA_VERSION:
                 label = max(1, version)
                 backup = self.path.with_name(
                     f"{self.path.stem}.v{label}-backup-{uuid4().hex}.sqlite3"
@@ -154,6 +233,11 @@ class Store:
                     "ALTER TABLE bat_bindings ADD COLUMN runtime TEXT NOT NULL DEFAULT 'claude' "
                     "CHECK (runtime IN ('claude', 'codex'))"
                 )
+            # Delivery columns stay NULL until the explicit conversion: initialize never
+            # changes how a still-legacy server sees its bindings.
+            for column, definition in BINDING_DELIVERY_COLUMNS.items():
+                if column not in binding_columns:
+                    conn.execute(f"ALTER TABLE bat_bindings ADD COLUMN {column} {definition}")
             notification_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(notifications)")
             }
@@ -163,7 +247,7 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS notification_key_lookup "
                 "ON notifications(notification_key_hash) WHERE notification_key_hash IS NOT NULL"
             )
-            conn.execute("PRAGMA user_version = 6")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
     def room(conn: sqlite3.Connection, room_id: str) -> RoomInfo:
@@ -368,6 +452,7 @@ class Store:
                     "AND acknowledged_at IS NULL)",
                     (room_id, request.member_name),
                 )
+                self.revoke_claim_grants(conn, room_id, old_member_id, at=self.stamp())
                 conn.execute(
                     "DELETE FROM bat_bindings WHERE binding_id = ?",
                     (old_binding["binding_id"],),
@@ -559,6 +644,7 @@ class Store:
                 (state, room_id, member_id),
             )
             if state == "left":
+                self.revoke_claim_grants(conn, room_id, member_id, at=self.stamp())
                 conn.execute(
                     "DELETE FROM bat_bindings WHERE room_id = ? AND member_id = ?",
                     (room_id, member_id),
@@ -573,8 +659,7 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
-    def bind_member(self, conn, room_id, member_id, target: BatRegistration, workspace):
-        """Register and bind atomically using the caller's authenticated identity."""
+    def require_bindable(self, conn, room_id, member_id, target: BatRegistration, workspace):
         member = self.member(conn, room_id, member_id)
         if not workspace or member["workspace"] != workspace or member["state"] == "left":
             raise MailroomError(
@@ -589,6 +674,10 @@ class Store:
             raise MailroomError(
                 409, "This BAT terminal is already bound to another member in this room."
             )
+
+    def bind_member(self, conn, room_id, member_id, target: BatRegistration, workspace):
+        """Register and bind atomically using the caller's authenticated identity."""
+        self.require_bindable(conn, room_id, member_id, target, workspace)
         existing = self.member_binding(conn, room_id, member_id)
         if existing and (
             existing["profile_id"],
@@ -597,6 +686,7 @@ class Store:
             existing["runtime"],
         ) == (target.profile_id, target.session_id, workspace, target.runtime):
             return existing
+        self.revoke_claim_grants(conn, room_id, member_id, at=self.stamp())
         conn.execute(
             "DELETE FROM bat_bindings WHERE room_id = ? AND member_id = ?", (room_id, member_id)
         )
@@ -650,17 +740,58 @@ class Store:
             ]
 
     @staticmethod
+    def revoke_claim_grants(conn, room_id, member_id, *, at, claim_id=None):
+        """Revoke notification grants in the caller's transaction, keeping claim history.
+
+        Without claim_id it covers every generation of the member; key_revoked_at is only set
+        where still empty, so the original revoke time survives. `at` is the caller's store-clock
+        stamp. Callers invoke this before they delete or replace the binding so both land in one
+        commit.
+        """
+        sql = (
+            "UPDATE delivery_claims SET key_revoked_at = ? WHERE room_id = ? AND member_id = ? "
+            "AND notification_key_hash IS NOT NULL AND key_revoked_at IS NULL"
+        )
+        args = [at, room_id, member_id]
+        if claim_id is not None:
+            sql += " AND claim_id = ?"
+            args.append(claim_id)
+        conn.execute(sql, args)
+
+    @staticmethod
     def notification_grant(conn, room_id, credential, *, status_only=False):
-        row = conn.execute(
-            "SELECT n.member_id, n.message_id, m.sender, m.acknowledged_at, u.state "
-            "FROM notifications n JOIN bat_bindings b ON b.binding_id = n.binding_id "
-            "AND b.room_id = n.room_id AND b.member_id = n.member_id "
-            "JOIN members u ON u.room_id = n.room_id AND u.member_id = n.member_id "
-            "JOIN messages m ON m.message_id = n.message_id AND m.room_id = n.room_id "
-            "AND m.recipient = u.member_name "
-            "WHERE n.notification_key_hash = ? AND n.room_id = ?",
+        # A hash with a delivery_claims row is judged only by that row's key_revoked_at, with no
+        # fallback to the notifications/binding join. Only hashes without a claim use that join.
+        claim = conn.execute(
+            "SELECT key_revoked_at FROM delivery_claims WHERE notification_key_hash = ? "
+            "AND room_id = ?",
             (credential.digest, room_id),
         ).fetchone()
+        if claim is not None:
+            row = (
+                None
+                if claim["key_revoked_at"] is not None
+                else conn.execute(
+                    "SELECT c.member_id, c.message_id, m.sender, m.acknowledged_at, u.state "
+                    "FROM delivery_claims c "
+                    "JOIN members u ON u.room_id = c.room_id AND u.member_id = c.member_id "
+                    "JOIN messages m ON m.message_id = c.message_id AND m.room_id = c.room_id "
+                    "AND m.recipient = u.member_name "
+                    "WHERE c.notification_key_hash = ? AND c.room_id = ?",
+                    (credential.digest, room_id),
+                ).fetchone()
+            )
+        else:
+            row = conn.execute(
+                "SELECT n.member_id, n.message_id, m.sender, m.acknowledged_at, u.state "
+                "FROM notifications n JOIN bat_bindings b ON b.binding_id = n.binding_id "
+                "AND b.room_id = n.room_id AND b.member_id = n.member_id "
+                "JOIN members u ON u.room_id = n.room_id AND u.member_id = n.member_id "
+                "JOIN messages m ON m.message_id = n.message_id AND m.room_id = n.room_id "
+                "AND m.recipient = u.member_name "
+                "WHERE n.notification_key_hash = ? AND n.room_id = ?",
+                (credential.digest, room_id),
+            ).fetchone()
         if row is None or row["state"] == "left":
             raise MailroomError(
                 403, "Notification credential is invalid or its binding was revoked."
@@ -688,17 +819,48 @@ class Store:
                 "ORDER BY m.message_id LIMIT 1",
                 (room_id, member["member_name"], notified_message, notified_message),
             ).fetchone()
+            # A message with a delivery claim reports its newest attempt (the claim table is the
+            # source for converted and normal mail); only claimless mail reads the old table.
+            latest = conn.execute(
+                "SELECT * FROM delivery_claims WHERE room_id = ? AND member_id = ? "
+                "AND message_id = (SELECT message_id FROM messages WHERE room_id = ? "
+                "AND recipient = ? AND acknowledged_at IS NULL AND (? IS NULL OR message_id = ?) "
+                "ORDER BY message_id LIMIT 1) ORDER BY claim_seq DESC LIMIT 1",
+                (
+                    room_id,
+                    member_id,
+                    room_id,
+                    member["member_name"],
+                    notified_message,
+                    notified_message,
+                ),
+            ).fetchone()
+            if latest is not None:
+                attempt = {
+                    k: latest[k]
+                    for k in (
+                        "message_id",
+                        "room_id",
+                        "member_id",
+                        "binding_id",
+                        "binding_version",
+                        "state",
+                        "unknown_reason",
+                        "outcome_reported_at",
+                        "updated_at",
+                    )
+                }
+            elif pending and pending["message_id"]:
+                attempt = {k: pending[k] for k in pending.keys() if k != "notification_key_hash"}
+            else:
+                attempt = None
             return {
                 "state": member["state"],
                 "binding": dict(binding) if binding else None,
                 "worker_enabled": bool(
                     binding and binding["binding_id"] in self.dispatch_binding_ids
                 ),
-                "pending_notification": {
-                    k: pending[k] for k in pending.keys() if k != "notification_key_hash"
-                }
-                if pending and pending["message_id"]
-                else None,
+                "pending_notification": attempt,
             }
 
     def next_notification(self, binding_id) -> dict | None:
@@ -765,6 +927,385 @@ class Store:
                 "WHERE state = 'submitting'",
                 (now(),),
             )
+
+    def convert_legacy_to_delivery(self) -> dict:
+        """Rerunnable data conversion for switching to delivery mode.
+
+        Schema creation (initialize) never does this: a still-legacy server must keep its
+        behaviour. Existing baselines and legacy attempts are never recomputed or copied again,
+        so a rerun only picks up rows added by the legacy server since the previous run.
+        """
+        with self.delivery_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stamp = now()
+            baselined = (
+                "SELECT count(*) FROM binding_generations WHERE migration_baseline IS NOT NULL"
+            )
+            baselined_before = conn.execute(baselined).fetchone()[0]
+            # The baseline is the member's highest known generation when first seen; no version
+            # means 0. COALESCE keeps an already-frozen baseline.
+            conn.execute(
+                "INSERT INTO binding_generations (room_id, member_id, highest_version, "
+                "migration_baseline) "
+                "SELECT room_id, member_id, MAX(COALESCE(binding_version, 0)), "
+                "MAX(COALESCE(binding_version, 0)) FROM ("
+                "SELECT room_id, member_id, binding_version FROM bat_bindings "
+                "UNION ALL SELECT room_id, member_id, NULL FROM notifications) "
+                "WHERE true GROUP BY room_id, member_id "
+                "ON CONFLICT (room_id, member_id) DO UPDATE SET "
+                "highest_version = MAX(highest_version, excluded.highest_version), "
+                "migration_baseline = COALESCE(migration_baseline, "
+                "MAX(highest_version, excluded.highest_version))"
+            )
+            baselined_after = conn.execute(baselined).fetchone()[0]
+            imported = conn.execute(
+                "UPDATE bat_bindings SET binding_state = 'pending', "
+                "binding_version = COALESCE(binding_version, 0) WHERE binding_state IS NULL"
+            ).rowcount
+            created = conn.execute(
+                "INSERT INTO delivery_claims (claim_id, origin, message_id, room_id, member_id, "
+                "recipient, binding_id, binding_version, state, unknown_reason, "
+                "notification_key_hash, key_revoked_at, created_at, updated_at) "
+                "SELECT 'legacy_' || n.message_id, 'legacy', n.message_id, n.room_id, n.member_id, "
+                "m.recipient, n.binding_id, g.highest_version, "
+                "CASE n.state WHEN 'submitting' THEN 'unknown' ELSE n.state END, "
+                "CASE WHEN n.state IN ('submitting', 'unknown') THEN 'legacy' END, "
+                "n.notification_key_hash, "
+                "CASE WHEN n.notification_key_hash IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM bat_bindings b WHERE b.binding_id = n.binding_id "
+                "AND b.room_id = n.room_id AND b.member_id = n.member_id) THEN ? END, "
+                "n.updated_at, ? "
+                "FROM notifications n JOIN messages m ON m.message_id = n.message_id "
+                "JOIN binding_generations g ON g.room_id = n.room_id AND g.member_id = n.member_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM delivery_claims c "
+                "WHERE c.origin = 'legacy' AND c.message_id = n.message_id)",
+                (stamp, stamp),
+            ).rowcount
+            return {
+                "bindings_imported": imported,
+                "legacy_claims_created": created,
+                "members_baselined": baselined_after - baselined_before,
+            }
+
+    def advance_binding_generation(
+        self, room_id, member_id, target: BatRegistration, workspace
+    ) -> dict:
+        """Start a new pending binding generation for this member in one transaction.
+
+        The version is max(highest known, migration baseline) + 1, so leaving or deleting a
+        binding never lowers it. Notification grants of every older generation are revoked; the
+        attempts themselves stay as history. The caller decides *when* a generation is due.
+        """
+        with self.delivery_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self.require_bindable(conn, room_id, member_id, target, workspace)
+            current = conn.execute(
+                "SELECT highest_version, migration_baseline FROM binding_generations "
+                "WHERE room_id = ? AND member_id = ?",
+                (room_id, member_id),
+            ).fetchone()
+            existing = self.member_binding(conn, room_id, member_id)
+            version = (
+                max(
+                    current["highest_version"] if current else 0,
+                    (current["migration_baseline"] if current else None) or 0,
+                    (existing["binding_version"] if existing else None) or 0,
+                )
+                + 1
+            )
+            conn.execute(
+                "INSERT INTO binding_generations (room_id, member_id, highest_version) "
+                "VALUES (?, ?, ?) ON CONFLICT (room_id, member_id) "
+                "DO UPDATE SET highest_version = excluded.highest_version",
+                (room_id, member_id, version),
+            )
+            self.revoke_claim_grants(conn, room_id, member_id, at=self.stamp())
+            conn.execute(
+                "DELETE FROM bat_bindings WHERE room_id = ? AND member_id = ?",
+                (room_id, member_id),
+            )
+            conn.execute(
+                "INSERT INTO bat_bindings (binding_id, room_id, member_id, profile_id, session_id, "
+                "workspace, runtime, binding_state, binding_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (
+                    uuid4().hex,
+                    room_id,
+                    member_id,
+                    target.profile_id,
+                    target.session_id,
+                    workspace,
+                    target.runtime,
+                    version,
+                ),
+            )
+            return self.member_binding(conn, room_id, member_id)
+
+    def confirm_binding(self, binding_id, binding_version, host_id, host_epoch) -> dict:
+        """Pending -> confirmed for exactly this version, owned by a currently valid host."""
+        with self.delivery_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            host = conn.execute(
+                "SELECT current_epoch FROM delivery_hosts WHERE host_id = ?", (host_id,)
+            ).fetchone()
+            if host is None:
+                raise MailroomError(409, "host_not_registered")
+            if host["current_epoch"] != host_epoch:
+                raise MailroomError(409, "instance_superseded")
+            binding = conn.execute(
+                "SELECT * FROM bat_bindings WHERE binding_id = ?", (binding_id,)
+            ).fetchone()
+            if binding is None:
+                raise MailroomError(404, "Binding does not exist.")
+            if binding["binding_state"] is None or binding["binding_version"] != binding_version:
+                raise MailroomError(409, "Binding version is not the current delivery version.")
+            if binding["binding_state"] == "confirmed" and binding["host_id"] == host_id:
+                return dict(binding)
+            if binding["binding_state"] != "pending":
+                raise MailroomError(409, "Binding is no longer pending.")
+            conn.execute(
+                "UPDATE bat_bindings SET binding_state = 'confirmed', host_id = ? "
+                "WHERE binding_id = ?",
+                (host_id, binding_id),
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM bat_bindings WHERE binding_id = ?", (binding_id,)
+                ).fetchone()
+            )
+
+    def stamp(self) -> str:
+        return self.clock().isoformat(timespec="milliseconds")
+
+    @staticmethod
+    def require_current_host(conn, host_id, host_epoch):
+        host = conn.execute(
+            "SELECT current_epoch FROM delivery_hosts WHERE host_id = ?", (host_id,)
+        ).fetchone()
+        if host is None:
+            raise MailroomError(409, "host_not_registered")
+        if host["current_epoch"] != host_epoch:
+            raise MailroomError(409, "instance_superseded")
+
+    @staticmethod
+    def claim_blocked(conn, binding, message_id) -> bool:
+        """The newest attempt for this room/member/message blocks while it is unresolved.
+
+        An attempt from an older generation does not: only an explicit newer, confirmed
+        generation can move an unacknowledged message past a blocking attempt.
+        """
+        latest = conn.execute(
+            "SELECT state, binding_version FROM delivery_claims "
+            "WHERE room_id = ? AND member_id = ? AND message_id = ? "
+            "ORDER BY claim_seq DESC LIMIT 1",
+            (binding["room_id"], binding["member_id"], message_id),
+        ).fetchone()
+        return (
+            latest is not None
+            and latest["state"] in BLOCKING_STATES
+            and latest["binding_version"] >= binding["binding_version"]
+        )
+
+    @staticmethod
+    def oldest_unacknowledged(conn, room_id, recipient):
+        row = conn.execute(
+            "SELECT message_id FROM messages WHERE room_id = ? AND recipient = ? "
+            "AND acknowledged_at IS NULL ORDER BY message_id LIMIT 1",
+            (room_id, recipient),
+        ).fetchone()
+        return row["message_id"] if row else None
+
+    def delivery_candidates(self, host_id, host_epoch) -> list[dict]:
+        """Read-only: confirmed bindings of this host whose oldest unacked message is free."""
+        with self.connection() as conn:
+            self.require_current_host(conn, host_id, host_epoch)
+            found = []
+            for binding in conn.execute(
+                "SELECT b.*, u.member_name FROM bat_bindings b JOIN members u "
+                "ON u.room_id = b.room_id AND u.member_id = b.member_id "
+                "WHERE b.binding_state = 'confirmed' AND b.host_id = ? AND u.state = 'active' "
+                "ORDER BY b.binding_id",
+                (host_id,),
+            ).fetchall():
+                oldest = self.oldest_unacknowledged(
+                    conn, binding["room_id"], binding["member_name"]
+                )
+                if oldest is not None and not self.claim_blocked(conn, binding, oldest):
+                    found.append(
+                        {
+                            "binding_id": binding["binding_id"],
+                            "binding_version": binding["binding_version"],
+                            "room_id": binding["room_id"],
+                            "message_id": oldest,
+                        }
+                    )
+            return found
+
+    def claim_delivery(
+        self,
+        binding_id,
+        binding_version,
+        message_id,
+        host_id,
+        host_epoch,
+        *,
+        key_factory=new_notification_key,
+    ) -> dict:
+        """Re-check everything in one transaction, then persist `submitting` and mint the key.
+
+        Nothing is written and key_factory is not called unless every check passes; the new
+        notification key is stored only as a hash and appears solely inside the returned prompt.
+        """
+        with self.delivery_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self.require_current_host(conn, host_id, host_epoch)
+            binding = conn.execute(
+                "SELECT * FROM bat_bindings WHERE binding_id = ?", (binding_id,)
+            ).fetchone()
+            if binding is None:
+                raise MailroomError(409, "binding_not_current")
+            if binding["binding_state"] != "confirmed":
+                raise MailroomError(409, "binding_not_confirmed")
+            if binding["binding_version"] != binding_version:
+                raise MailroomError(409, "binding_version_mismatch")
+            if binding["host_id"] != host_id:
+                raise MailroomError(409, "binding_host_mismatch")
+            member = self.member(conn, binding["room_id"], binding["member_id"])
+            if member["state"] != "active":
+                raise MailroomError(409, "member_not_active")
+            message = conn.execute(
+                "SELECT * FROM messages WHERE message_id = ? AND room_id = ? AND recipient = ?",
+                (message_id, binding["room_id"], member["member_name"]),
+            ).fetchone()
+            if message is None:
+                raise MailroomError(404, "Message not found for this binding.")
+            if message["acknowledged_at"] is not None:
+                raise MailroomError(409, "message_acknowledged")
+            if self.oldest_unacknowledged(conn, binding["room_id"], member["member_name"]) != (
+                message_id
+            ):
+                raise MailroomError(409, "message_not_oldest")
+            if self.claim_blocked(conn, binding, message_id):
+                raise MailroomError(409, "blocked_by_previous_claim")
+            key = key_factory()
+            sent = self.clock()
+            claim_id = f"claim_{uuid4().hex}"
+            deadlines = (
+                (sent + SEND_DEADLINE).isoformat(timespec="milliseconds"),
+                (sent + REPORT_DEADLINE).isoformat(timespec="milliseconds"),
+            )
+            conn.execute(
+                "INSERT INTO delivery_claims (claim_id, origin, message_id, room_id, member_id, "
+                "recipient, binding_id, binding_version, host_id, host_epoch, state, "
+                "send_deadline, report_deadline, notification_key_hash, created_at, updated_at) "
+                "VALUES (?, 'normal', ?, ?, ?, ?, ?, ?, ?, ?, 'submitting', ?, ?, ?, ?, ?)",
+                (
+                    claim_id,
+                    message_id,
+                    binding["room_id"],
+                    binding["member_id"],
+                    member["member_name"],
+                    binding_id,
+                    binding_version,
+                    host_id,
+                    host_epoch,
+                    *deadlines,
+                    hashlib.sha256(key.encode()).hexdigest(),
+                    self.stamp(),
+                    self.stamp(),
+                ),
+            )
+            result = {
+                "claim_id": claim_id,
+                "binding_id": binding_id,
+                "binding_version": binding_version,
+                "room_id": binding["room_id"],
+                "message_id": message_id,
+                "send_deadline": deadlines[0],
+                "report_deadline": deadlines[1],
+                "prompt": notification_prompt(
+                    {"room_id": binding["room_id"], "message_id": message_id}, key
+                ),
+            }
+        return result
+
+    def record_outcome(self, claim_id, binding_id, binding_version, result, evidence=None) -> dict:
+        """Record the runtime result of exactly one claim.
+
+        Allowed only for `submitting`, or for a `report_timeout` unknown that has not yet
+        received its single late result. `outcome_reported_at` is the one marker that a runtime
+        result was received. The claim's grant is revoked only by `released`.
+        """
+        if result not in OUTCOME_RESULTS:
+            raise MailroomError(422, "unknown_outcome_result")
+        if result == "released" and not (evidence and RELEASE_EVIDENCE.fullmatch(evidence)):
+            raise MailroomError(422, "released_requires_not_sent_evidence")
+        with self.delivery_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                "SELECT * FROM delivery_claims WHERE claim_id = ?", (claim_id,)
+            ).fetchone()
+            if claim is None:
+                raise MailroomError(404, "Claim not found.")
+            if claim["origin"] == "legacy":
+                raise MailroomError(409, "claim_not_accepting_outcome")
+            if (claim["binding_id"], claim["binding_version"]) != (binding_id, binding_version):
+                raise MailroomError(409, "binding_mismatch")
+            late = claim["state"] == "unknown" and claim["unknown_reason"] == "report_timeout"
+            if claim["outcome_reported_at"] is not None:
+                if claim["state"] != result:
+                    raise MailroomError(409, "conflicting_outcome")
+                return self.public_claim(claim)
+            if claim["state"] != "submitting" and not late:
+                raise MailroomError(409, "claim_not_accepting_outcome")
+            stamp = self.stamp()
+            conn.execute(
+                "UPDATE delivery_claims SET state = ?, unknown_reason = ?, evidence = ?, "
+                "outcome_reported_at = ?, updated_at = ? "
+                "WHERE claim_id = ?",
+                (
+                    result,
+                    claim["unknown_reason"] or ("runtime_unknown" if result == "unknown" else None),
+                    evidence,
+                    stamp,
+                    stamp,
+                    claim_id,
+                ),
+            )
+            if result == "released":
+                self.revoke_claim_grants(
+                    conn, claim["room_id"], claim["member_id"], claim_id=claim_id, at=stamp
+                )
+            return self.public_claim(
+                conn.execute(
+                    "SELECT * FROM delivery_claims WHERE claim_id = ?", (claim_id,)
+                ).fetchone()
+            )
+
+    @staticmethod
+    def public_claim(row) -> dict:
+        return {k: row[k] for k in row.keys() if k != "notification_key_hash"}
+
+    def expire_overdue_claims(self) -> int:
+        """Past report_deadline a submitting claim becomes unknown(report_timeout), not released."""
+        stamp = self.stamp()
+        with self.delivery_lock, self.connection() as conn:
+            return conn.execute(
+                "UPDATE delivery_claims SET state = 'unknown', unknown_reason = 'report_timeout', "
+                "updated_at = ? WHERE origin = 'normal' AND state = 'submitting' "
+                "AND report_deadline < ?",
+                (stamp, stamp),
+            ).rowcount
+
+    def recover_delivery_claims(self) -> int:
+        """Server-start recovery: unfinished attempts become unknown(startup_recovery)."""
+        with self.delivery_lock, self.connection() as conn:
+            return conn.execute(
+                "UPDATE delivery_claims SET state = 'unknown', "
+                "unknown_reason = 'startup_recovery', "
+                "updated_at = ? WHERE origin = 'normal' AND state = 'submitting'",
+                (self.stamp(),),
+            ).rowcount
 
     def binding_error(self, binding_id, error):
         with self.connection() as conn:

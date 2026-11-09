@@ -109,10 +109,17 @@ class NotificationAttempt(BaseModel):
     room_id: str
     member_id: str
     binding_id: str
-    client_message_id: str
-    state: Literal["submitting", "accepted", "unknown", "not_accepted"]
-    queued: bool | None
+    # Old-mode attempts carry the BAT client id and queue flag; delivery claims have neither.
+    client_message_id: str | None = None
+    state: Literal["submitting", "accepted", "unknown", "not_accepted", "released"]
+    queued: bool | None = None
     updated_at: str
+    # Delivery claims only. unknown_reason is history: a late accepted keeps report_timeout.
+    binding_version: int | None = None
+    unknown_reason: (
+        Literal["report_timeout", "startup_recovery", "runtime_unknown", "legacy"] | None
+    ) = None
+    outcome_reported_at: str | None = None
 
 
 class NotificationStatus(BaseModel):
