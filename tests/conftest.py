@@ -16,6 +16,7 @@ from delivery_helpers import (
     register_host,
     target,
 )
+from delivery_stack import started
 from fastapi.testclient import TestClient
 
 from agent_mailroom.api import create_app
@@ -39,6 +40,13 @@ def database(tmp_path):
 def api(database):
     with TestClient(create_app(database), base_url="http://127.0.0.1") as client:
         yield client
+
+
+@pytest.fixture
+def dstack(database, tmp_path):
+    """Delivery-mode app over a fresh DB with a really issued credential file."""
+    with started(database, tmp_path / "creds" / "delivery-credential.json") as stack:
+        yield stack
 
 
 @pytest.fixture
