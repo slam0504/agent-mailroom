@@ -5,6 +5,7 @@ import importlib.util
 import json
 import ssl
 import threading
+import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +15,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
-from websockets.sync.client import connect
 from websockets.sync.server import serve
 
 spec = importlib.util.spec_from_file_location(
@@ -28,7 +28,6 @@ class Peer:
     def __init__(self):
         self.sent = []
         self.replies = deque()
-        self.socket = self
         self.version = "3.2.10"
         self.preset = "claude-code"
         self.profile_type = "local"
@@ -38,11 +37,14 @@ class Peer:
         self.fail_send = False
         self.resting = False
         self.targets = {}  # Optional multi-session fixture for dynamic registration tests.
+        self.send_delay = 0  # Lets tests force a reply to arrive after a client-side timeout.
 
-    def getpeercert(self, binary_form):
+    def peer_certificate(self):
         return b"test-certificate"
 
     def send(self, raw):
+        if self.send_delay:
+            time.sleep(self.send_delay)
         frame = json.loads(raw)
         self.sent.append(frame)
         if frame["type"] == "auth":
@@ -375,18 +377,112 @@ def tls_bat_peer(tmp_path, request):
         assert not thread.is_alive()
 
 
+def client_tls_context():
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    tls.check_hostname = False
+    tls.verify_mode = ssl.CERT_NONE
+    return tls
+
+
 def test_local_tls_websocket_auth_profile_and_send(tls_bat_peer):
     peer, url, fingerprint = tls_bat_peer
-    client_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    client_tls.check_hostname = False
-    client_tls.verify_mode = ssl.CERT_NONE
-    with connect(url, ssl=client_tls, proxy=None, compression=None) as ws:
+    with poc.open_connection(url, client_tls_context(), proxy=None, compression=None) as ws:
         probe = poc.BatProbe(ws, output=lambda *args, **kwargs: None)
         probe.authenticate("test-token", fingerprint)
         probe.open_profile("default")
         probe.send("bat-id", "PoC only", "request-1")
     assert peer.sent[0]["token"] == "test-token"
     assert peer.sent[-1]["channel"] == "claude:send-message"
+
+
+def test_client_ssl_activity_is_confined_to_the_loop_thread_and_close_unblocks_recv(
+    tls_bat_peer, monkeypatch
+):
+    """Every client-side SSL call must happen on 'mailroom-bat-loop', never the fake BAT
+    server's thread, and closing from another thread must promptly interrupt a pending recv
+    instead of hanging until its timeout. This is the race the old sync client could not
+    rule out: its background recv_events thread read the SSL socket while a second thread
+    wrote/closed it, which is how SSL_read vs. SSL_write/SSL_free crashed concurrently.
+    """
+    peer, url, fingerprint = tls_bat_peer
+    lock = threading.Lock()
+    object_calls, socket_calls = [], []
+
+    def recorder(bucket, name, original):
+        def wrapper(self, *args, **kwargs):
+            with lock:
+                bucket.append((name, threading.current_thread().name))
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    for name in ("read", "write", "do_handshake", "unwrap"):
+        monkeypatch.setattr(
+            ssl.SSLObject, name, recorder(object_calls, name, getattr(ssl.SSLObject, name))
+        )
+    for name in ("recv", "recv_into", "send", "sendall", "read", "write"):
+        monkeypatch.setattr(
+            ssl.SSLSocket, name, recorder(socket_calls, name, getattr(ssl.SSLSocket, name))
+        )
+
+    ws = poc.open_connection(
+        url, client_tls_context(), proxy=None, compression=None, close_timeout=2
+    )
+    probe = poc.BatProbe(ws, output=lambda *args, **kwargs: None)
+    probe.authenticate("test-token", fingerprint)
+    probe.open_profile("default")
+    probe.send("bat-id", "PoC only", "request-1")
+
+    outcome = {}
+
+    def blocked_recv():
+        start = time.monotonic()
+        try:
+            ws.recv(timeout=30)
+        except BaseException as exc:  # Whatever close() raises, record it for the assertion.
+            outcome["exc"] = exc
+        outcome["elapsed"] = time.monotonic() - start
+
+    recv_thread = threading.Thread(target=blocked_recv)
+    recv_thread.start()
+    time.sleep(0.2)  # Let recv() register on the connection before closing it.
+    ws.close()
+    recv_thread.join(timeout=5)
+
+    assert not recv_thread.is_alive()
+    assert isinstance(outcome.get("exc"), poc.WebSocketException)
+    assert outcome["elapsed"] < 5
+
+    assert object_calls, "expected SSLObject activity confined to the loop thread"
+    assert socket_calls, "expected SSLSocket activity from the fake BAT server thread"
+    assert {thread_name for _, thread_name in object_calls} == {"mailroom-bat-loop"}
+    client_threads = {threading.current_thread().name, recv_thread.name, "mailroom-bat-loop"}
+    assert not [call for call in socket_calls if call[1] in client_threads]
+
+
+def test_recv_timeout_raises_builtin_timeout_and_next_recv_gets_the_delayed_reply(tls_bat_peer):
+    peer, url, fingerprint = tls_bat_peer
+    with poc.open_connection(url, client_tls_context(), proxy=None, compression=None) as ws:
+        peer.send_delay = 0.3
+        request_id = "probe-timeout"
+        ws.send(
+            json.dumps(
+                {
+                    "type": "auth",
+                    "token": "test-token",
+                    "protocols": [poc.PROTOCOL],
+                    "compression": ["none"],
+                    "args": [],
+                    "id": request_id,
+                }
+            )
+        )
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.05)
+        peer.send_delay = 0
+        reply = json.loads(ws.recv(timeout=5))
+    assert reply["id"] == request_id
+    assert reply["result"] is True
 
 
 @pytest.mark.parametrize(

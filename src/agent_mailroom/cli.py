@@ -4,6 +4,15 @@ import argparse
 import os
 from pathlib import Path
 
+DEFAULT_DATABASE = Path.home() / ".local/share/agent-mailroom/mailroom.sqlite3"
+CREDENTIAL_NAME = "delivery-credential.json"
+
+
+def credential_path(option: Path | None, database: Path) -> Path:
+    """Resolve only the parent: the last segment must stay visible so a symlink is refused."""
+    path = (option or database.with_name(CREDENTIAL_NAME)).expanduser()
+    return path.parent.resolve() / path.name
+
 
 def port_number(value: str) -> int:
     port = int(value)
@@ -22,10 +31,26 @@ def main() -> None:
     serve.add_argument(
         "--database",
         type=Path,
-        default=Path.home() / ".local/share/agent-mailroom/mailroom.sqlite3",
+        default=DEFAULT_DATABASE,
     )
     serve.add_argument("--bat-url", help="BAT endpoint (default: wss://127.0.0.1:9876)")
     serve.add_argument("--bat-fingerprint", help="SHA-256 shown by BAT Remote Access")
+    serve.add_argument(
+        "--delivery-host",
+        action="store_true",
+        help="Delivery mode: issue/keep a delivery credential file (excludes --bat-*)",
+    )
+    serve.add_argument(
+        "--delivery-credential-file",
+        type=Path,
+        help="Delivery credential file (default: delivery-credential.json next to the database)",
+    )
+    rotate = commands.add_parser(
+        "rotate-delivery-credential",
+        help="Replace the delivery credential of the host named by the credential file",
+    )
+    rotate.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    rotate.add_argument("--delivery-credential-file", type=Path)
     bridge = commands.add_parser(
         "mcp", help="Run a stdio MCP bridge; agents register their own sessions"
     )
@@ -40,9 +65,36 @@ def main() -> None:
         help="Shared directory for automatically saved session credentials",
     )
     args = parser.parse_args()
+    # Argument conflicts are rejected before any database or file is touched.
+    if args.command == "serve":
+        if args.delivery_host and (args.bat_url is not None or args.bat_fingerprint is not None):
+            parser.error("--delivery-host and --bat-url/--bat-fingerprint are mutually exclusive.")
+        if args.delivery_credential_file is not None and not args.delivery_host:
+            parser.error("--delivery-credential-file requires --delivery-host.")
     os.umask(0o077)
 
-    if args.command == "serve":
+    if args.command == "rotate-delivery-credential":
+        import sqlite3
+
+        from .delivery import CredentialFileError, rotate_credential
+        from .store import Store
+
+        database = args.database.expanduser().resolve()
+        credential = credential_path(args.delivery_credential_file, database)
+        if not database.is_file():
+            parser.exit(1, "agent-mailroom: database does not exist; nothing was changed.\n")
+        try:
+            host_id = rotate_credential(Store(database), credential)
+        except CredentialFileError as exc:
+            parser.exit(1, f"agent-mailroom: {exc}\n")
+        except (OSError, sqlite3.Error) as exc:
+            parser.exit(
+                1,
+                f"agent-mailroom: rotation failed ({type(exc).__name__}); "
+                "fix the cause and rerun rotate-delivery-credential.\n",
+            )
+        print(f"Rotated delivery credential for {host_id}.")
+    elif args.command == "serve":
         import uvicorn
 
         from .api import create_app
@@ -74,8 +126,16 @@ def main() -> None:
                 )
             except (ValueError, EOFError, ProbeError) as exc:
                 parser.exit(1, f"agent-mailroom: invalid BAT settings ({type(exc).__name__})\n")
+        database = args.database.expanduser().resolve()
+        if args.delivery_host:
+            from .delivery import DeliverySettings
+
+            credential = credential_path(args.delivery_credential_file, database)
+            app = create_app(database, delivery=DeliverySettings(credential))
+        else:
+            app = create_app(database, bat_settings)
         uvicorn.run(
-            create_app(args.database.expanduser().resolve(), bat_settings),
+            app,
             host="127.0.0.1",
             port=args.port,
             access_log=False,

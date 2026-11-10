@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 
 from websockets.exceptions import WebSocketException
-from websockets.sync.client import connect
 
 from agent_mailroom.bat import PROTOCOL as PROTOCOL  # Compatibility for the PoC protocol tests.
 from agent_mailroom.bat import (
@@ -17,6 +16,7 @@ from agent_mailroom.bat import (
     ProbeError,
     emit,
     fingerprint,
+    open_connection,
     validate_url,
 )
 
@@ -54,9 +54,9 @@ def main():
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         tls.check_hostname = False
         tls.verify_mode = ssl.CERT_NONE
-        with connect(
+        with open_connection(
             args.url,
-            ssl=tls,
+            tls,
             proxy=None,
             compression=None,
             close_timeout=2,

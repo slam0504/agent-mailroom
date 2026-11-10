@@ -181,7 +181,7 @@ v0.5 以前的通知沒有 notification_key。升級不會自動重送 accepted�
 
 `notification_status` 只回傳自己的狀態、綁定、`worker_enabled` 與 `pending_notification`。`worker_enabled` 表示本程序的 worker 已啟用，不保證 BAT 在線或模型已處理信件。`last_error` 記錄最近一次送出前檢查或通知問題。
 
-worker 每兩秒檢查信箱。同一成員最多有一則尚未確認處理的通知；後面的信等待最舊信件被確認。
+worker 每兩秒檢查信箱。最舊的信因 resting、Codex 等待使用者或送出前檢查失敗而暫緩時，下一次檢查間隔依序拉長為 2、4、8、16、30 秒，之後維持 30 秒；送出、沒有待送信件或發生其他錯誤時，恢復每兩秒檢查。因此狀態解除後，最多約 30 秒才會送出通知。同一成員最多有一則尚未確認處理的通知；後面的信等待最舊信件被確認。
 
 對話處於 resting 時不送出，`last_error` 為 `resting`；使用者喚醒後才送。Claude 等待使用者回答或權限確認時照常送出，由 BAT 排在該回合之後。Codex 在回合進行中收到訊息會取代該回合，因此等待使用者時不送出，`last_error` 為 `waiting_for_BAT_user`。
 

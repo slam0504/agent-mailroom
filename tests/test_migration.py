@@ -72,7 +72,8 @@ def test_v01_upgrade_backs_up_and_preserves_room_message_ids_and_auth(database):
     Store(database).initialize()
     assert len(list(database.parent.glob("*.v1-backup-*.sqlite3"))) == 1
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("SELECT count(*) FROM delivery_claims").fetchone()[0] == 0
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -94,7 +95,7 @@ def test_v5_upgrade_adds_room_scoped_revocations_and_backup(database):
     store.initialize()
     assert len(list(database.parent.glob("*.v5-backup-*.sqlite3"))) == 1
     with sqlite3.connect(database) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'revoked_members'"
         ).fetchone()
